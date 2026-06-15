@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "WTLinker",
+  "version": "0.1.0",
+  "identifier": "wtlinker.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5175",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "WTLinker (WT 标签页 AI 分发器)",
+        "width": 1024,
+        "height": 765,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
+  },
+  "plugins": {}
+}
