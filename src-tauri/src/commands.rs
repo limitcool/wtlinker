@@ -13,7 +13,7 @@ use std::time::UNIX_EPOCH;
 /// WT 窗口信息
 #[derive(Clone, Serialize, Deserialize)]
 pub struct WindowInfo {
-    pub id: u32,
+    pub id: i64,
     pub title: String,
     pub pid: u32,
     pub tabs: Vec<String>,
@@ -151,7 +151,7 @@ foreach ($hwnd in $hwnds) {
     } catch {}
     
     $wtWindows += [PSCustomObject]@{
-        id = [int]$hwnd
+        id = [long]$hwnd
         title = $title
         pid = [int]$procId
         tabs = $tabsList
@@ -190,7 +190,7 @@ if ($wtWindows.Count -eq 0) {
 }
 
 /// 激活特定 HWND 窗口的辅助函数
-fn activate_window(hwnd: u32) {
+fn activate_window(hwnd: i64) {
     let script = format!(
         r#"
 $code = @"
@@ -291,7 +291,7 @@ fn build_wt_args_vec(entries: &[Entry], flags: &str, append_mode: bool, shell: &
 
 /// 启动 Windows Terminal
 #[tauri::command]
-pub fn launch_wt(config: Config, target_window: Option<u32>) -> Result<String, String> {
+pub fn launch_wt(config: Config, target_window: Option<i64>) -> Result<String, String> {
     // 收集启用的、有目录的项
     let to_launch: Vec<&Entry> = config
         .entries
