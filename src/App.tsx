@@ -288,6 +288,40 @@ function App() {
     }
   }
 
+  // 转换会话
+  const handleConvertSession = async () => {
+    if (!currentEditingEntry) return
+    const { session, dir, ai } = currentEditingEntry
+    if (!session || !dir) {
+      setStatus('会话 ID 或项目目录为空，无法转换')
+      return
+    }
+
+    setStatus('正在进行会话格式转换与导入...')
+    try {
+      if (ai === 'claude') {
+        const msg = await invoke<string>('convert_claude_to_codex', { 
+          sessionId: session, 
+          cwd: dir 
+        })
+        updateEntry(editIndex, { ai: 'codex' })
+        setStatus(msg)
+      } else if (ai === 'codex') {
+        const msg = await invoke<string>('convert_codex_to_claude', { 
+          sessionId: session, 
+          cwd: dir 
+        })
+        updateEntry(editIndex, { ai: 'claude' })
+        setStatus(msg)
+      }
+      setIsHistoryModalOpen(false)
+      setSessionMessages([])
+    } catch (e) {
+      console.error('转换会话失败:', e)
+      setStatus(`转换失败: ${e}`)
+    }
+  }
+
   // 启动
   const handleLaunch = async () => {
     setStatus('正在激活并分发会话...')
@@ -1001,7 +1035,17 @@ function App() {
             </div>
 
             {/* 底部按钮 */}
-            <div className="flex justify-end pt-3 border-t border-[#1b2233]/65 shrink-0">
+            <div className="flex justify-between items-center pt-3 border-t border-[#1b2233]/65 shrink-0">
+              <div>
+                {currentEditingEntry && (currentEditingEntry.ai === 'claude' || currentEditingEntry.ai === 'codex') && (
+                  <button
+                    onClick={handleConvertSession}
+                    className="h-9 px-4 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-bold transition-all active:scale-[0.98] border border-indigo-400/10 shadow-lg shadow-indigo-950/20"
+                  >
+                    {currentEditingEntry.ai === 'claude' ? '➡️ 导入并转换为 Codex 会话' : '➡️ 导入并转换为 Claude 会话'}
+                  </button>
+                )}
+              </div>
               <button
                 onClick={() => {
                   setIsHistoryModalOpen(false)

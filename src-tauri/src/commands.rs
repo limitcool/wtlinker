@@ -899,3 +899,321 @@ pub fn get_session_details(session_id: String, ai: AiProgram) -> Result<Vec<Code
 
     Ok(messages)
 }
+
+fn escape_project_path(cwd: &str) -> String {
+    cwd.replace(':', "-").replace('\\', "-").replace('/', "-")
+}
+
+fn generate_dummy_uuid() -> String {
+    use std::time::SystemTime;
+    let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut seed = start as u64;
+    
+    let mut next_random = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed
+    };
+
+    let r1 = next_random();
+    let r2 = next_random();
+    let r3 = next_random();
+    let r4 = next_random();
+
+    format!(
+        "{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",
+        (r1 & 0xFFFFFFFF) as u32,
+        ((r1 >> 32) & 0xFFFF) as u16,
+        ((r2) & 0xFFF) as u16,
+        ((r2 >> 12) & 0xFFF) as u16,
+        (r3 as u64) << 16 | ((r4 & 0xFFFF) as u64)
+    )
+}
+
+#[tauri::command]
+pub fn convert_claude_to_codex(session_id: String, cwd: String) -> Result<String, String> {
+    let user_profile = std::env::var("USERPROFILE")
+        .map_err(|_| "无法获取 USERPROFILE 环境变量".to_string())?;
+
+    let sessions_dir = PathBuf::from(&user_profile).join(".claude").join("projects");
+    if !sessions_dir.exists() {
+        return Err("未找到 .claude/projects 目录".to_string());
+    }
+
+    let mut jsonl_files = Vec::new();
+    scan_files_by_ext(&sessions_dir, "jsonl", &mut jsonl_files);
+
+    let mut matched_path = None;
+    for path in jsonl_files {
+        if let Ok(file) = File::open(&path) {
+            let reader = BufReader::new(file);
+            use serde_json::Value;
+            for line_res in reader.lines() {
+                if let Ok(line) = line_res {
+                    if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                        if let Some(sid) = val.get("sessionId").and_then(|s| s.as_str()) {
+                            if sid == session_id {
+                                matched_path = Some(path.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if matched_path.is_some() {
+                break;
+            }
+        }
+    }
+
+    let path = match matched_path {
+        Some(p) => p,
+        None => return Err(format!("未找到会话 ID 为 {} 的 Claude 日志文件", session_id)),
+    };
+
+    let file = File::open(path).map_err(|e| format!("无法打开 Claude 日志文件: {}", e))?;
+    let reader = BufReader::new(file);
+
+    let codex_sessions_dir = PathBuf::from(&user_profile).join(".codex").join("sessions");
+    fs::create_dir_all(&codex_sessions_dir).map_err(|e| format!("创建 .codex/sessions 目录失败: {}", e))?;
+    let target_codex_path = codex_sessions_dir.join(format!("{}.jsonl", session_id));
+
+    let mut writer = File::create(&target_codex_path).map_err(|e| format!("无法创建目标 Codex 日志文件: {}", e))?;
+    use std::io::Write;
+    use serde_json::{json, Value};
+    use std::time::SystemTime;
+    
+    let mut session_timestamp = format_timestamp_ms(
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    );
+
+    let mut codex_messages = Vec::new();
+
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if let Ok(val) = serde_json::from_str::<Value>(&line) {
+            if let Some(ts) = val.get("timestamp").and_then(|t| t.as_str()) {
+                if !ts.is_empty() {
+                    session_timestamp = ts.to_string();
+                }
+            }
+
+            let role_opt = val.get("type").and_then(|t| t.as_str());
+            if let Some(role) = role_opt {
+                if role == "user" {
+                    if let Some(content) = val.pointer("/message/content").and_then(|c| c.as_str()) {
+                        codex_messages.push(json!({
+                            "timestamp": session_timestamp.clone(),
+                            "type": "node_message",
+                            "payload": {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": content
+                                    }
+                                ]
+                            }
+                        }));
+                    }
+                } else if role == "assistant" {
+                    let mut text_content = String::new();
+                    if let Some(content_arr) = val.pointer("/message/content").and_then(|c| c.as_array()) {
+                        for item in content_arr {
+                            if let Some(t) = item.get("type").and_then(|tp| tp.as_str()) {
+                                if t == "text" {
+                                    if let Some(txt) = item.get("text").and_then(|tx| tx.as_str()) {
+                                        text_content.push_str(txt);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !text_content.is_empty() {
+                        codex_messages.push(json!({
+                            "timestamp": session_timestamp.clone(),
+                            "type": "node_message",
+                            "payload": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": text_content
+                                    }
+                                ]
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    let meta_line = json!({
+        "timestamp": session_timestamp,
+        "type": "session_meta",
+        "payload": {
+            "id": session_id,
+            "cwd": cwd
+        }
+    });
+    writeln!(writer, "{}", meta_line.to_string()).map_err(|e| format!("写入首行失败: {}", e))?;
+
+    for msg in codex_messages {
+        writeln!(writer, "{}", msg.to_string()).map_err(|e| format!("写入消息行失败: {}", e))?;
+    }
+
+    Ok(format!("成功转换 Claude 会话 {} 到 Codex", session_id))
+}
+
+#[tauri::command]
+pub fn convert_codex_to_claude(session_id: String, cwd: String) -> Result<String, String> {
+    let user_profile = std::env::var("USERPROFILE")
+        .map_err(|_| "无法获取 USERPROFILE 环境变量".to_string())?;
+
+    let sessions_dir = PathBuf::from(&user_profile).join(".codex").join("sessions");
+    if !sessions_dir.exists() {
+        return Err("未找到 .codex/sessions 目录".to_string());
+    }
+
+    let mut jsonl_files = Vec::new();
+    scan_files_by_ext(&sessions_dir, "jsonl", &mut jsonl_files);
+
+    let mut matched_path = None;
+    for path in jsonl_files {
+        if let Ok(file) = File::open(&path) {
+            let mut reader = BufReader::new(file);
+            let mut first_line = String::new();
+            if reader.read_line(&mut first_line).is_ok() {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&first_line) {
+                    if meta.msg_type == "session_meta" && meta.payload.id == session_id {
+                        matched_path = Some(path.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let path = match matched_path {
+        Some(p) => p,
+        None => return Err(format!("未找到会话 ID 为 {} 的 Codex 日志文件", session_id)),
+    };
+
+    let file = File::open(path).map_err(|e| format!("无法打开 Codex 日志文件: {}", e))?;
+    let reader = BufReader::new(file);
+
+    let escaped_cwd = escape_project_path(&cwd);
+    let claude_project_dir = PathBuf::from(&user_profile)
+        .join(".claude")
+        .join("projects")
+        .join(&escaped_cwd);
+    fs::create_dir_all(&claude_project_dir).map_err(|e| format!("创建 Claude 项目目录失败: {}", e))?;
+    let target_claude_path = claude_project_dir.join(format!("{}.jsonl", session_id));
+
+    let mut writer = File::create(&target_claude_path).map_err(|e| format!("无法创建目标 Claude 日志文件: {}", e))?;
+    use std::io::Write;
+    use serde_json::{json, Value};
+
+    let first_line = json!({
+        "type": "mode",
+        "mode": "normal",
+        "sessionId": session_id
+    });
+    let second_line = json!({
+        "type": "permission-mode",
+        "permissionMode": "bypassPermissions",
+        "sessionId": session_id
+    });
+
+    writeln!(writer, "{}", first_line.to_string()).map_err(|e| format!("写入首行引导失败: {}", e))?;
+    writeln!(writer, "{}", second_line.to_string()).map_err(|e| format!("写入第二行引导失败: {}", e))?;
+
+    let mut parent_uuid: Option<String> = None;
+
+    let mut is_first = true;
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if is_first {
+            is_first = false;
+            continue;
+        }
+
+        if let Ok(val) = serde_json::from_str::<Value>(&line) {
+            let msg_type = val.get("type").and_then(|t| t.as_str());
+            if msg_type == Some("node_message") {
+                let role = val.pointer("/payload/role").and_then(|r| r.as_str()).unwrap_or("user");
+                let mut text_content = String::new();
+                
+                if let Some(content_arr) = val.pointer("/payload/content").and_then(|c| c.as_array()) {
+                    for item in content_arr {
+                        if let Some(t) = item.get("type").and_then(|tp| tp.as_str()) {
+                            if t == "text" {
+                                if let Some(txt) = item.get("text").and_then(|tx| tx.as_str()) {
+                                    text_content.push_str(txt);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if text_content.is_empty() {
+                    if let Some(txt) = val.pointer("/payload/content/0/input_text").and_then(|t| t.as_str()) {
+                        text_content = txt.to_string();
+                    } else if let Some(txt) = val.pointer("/payload/content/0/output_text").and_then(|t| t.as_str()) {
+                        text_content = txt.to_string();
+                    }
+                }
+
+                let current_uuid = generate_dummy_uuid();
+                let timestamp = val.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+
+                let claude_line = if role == "user" {
+                    json!({
+                        "parentUuid": parent_uuid,
+                        "isSidechain": false,
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": text_content
+                        },
+                        "uuid": current_uuid.clone(),
+                        "timestamp": timestamp,
+                        "permissionMode": "bypassPermissions",
+                        "cwd": cwd,
+                        "sessionId": session_id
+                    })
+                } else {
+                    json!({
+                        "parentUuid": parent_uuid,
+                        "isSidechain": false,
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": text_content
+                                }
+                            ]
+                        },
+                        "uuid": current_uuid.clone(),
+                        "timestamp": timestamp,
+                        "cwd": cwd,
+                        "sessionId": session_id
+                    })
+                };
+
+                writeln!(writer, "{}", claude_line.to_string()).map_err(|e| format!("写入转换行失败: {}", e))?;
+                parent_uuid = Some(current_uuid);
+            }
+        }
+    }
+
+    Ok(format!("成功转换 Codex 会话 {} 到 Claude", session_id))
+}

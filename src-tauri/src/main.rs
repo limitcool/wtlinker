@@ -17,6 +17,8 @@ fn main() {
             launch_wt,
             get_sessions,
             get_session_details,
+            convert_claude_to_codex,
+            convert_codex_to_claude,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
