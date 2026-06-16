@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// AI 程序类型
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum AiProgram {
     Claude,

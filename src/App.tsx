@@ -97,6 +97,7 @@ function App() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [codexSessions, setCodexSessions] = useState<CodexSession[]>([])
   const [showWtTabsPreview, setShowWtTabsPreview] = useState(false)
+  const [searchText, setSearchText] = useState('')
 
   // 弹窗与历史会话状态
   const [isEditModalOpen, setIsEditModalOpen] = useState(false)
@@ -121,22 +122,50 @@ function App() {
     setStatus(`已将全局及所有项目的默认 AI 切换为 ${ai === 'claude' ? 'Claude' : ai === 'opencode' ? 'OpenCode' : 'Codex'}`)
   }
 
-  // 监听当前编辑的项目的 AI/dir 变化以加载 CodexSessions
+  const currentEntry = editIndex >= 0 ? config.entries[editIndex] : null
+  const entryDir = currentEntry?.dir
+  const entryAi = currentEntry?.ai
+
+  // 监听当前编辑的项目的 AI/dir 变化以加载 sessions (支持 codex, claude, opencode)
   useEffect(() => {
-    const entry = editIndex >= 0 ? config.entries[editIndex] : null
-    if (entry && entry.ai === 'codex' && entry.dir) {
-      invoke<CodexSession[]>('get_codex_sessions', { dir: entry.dir })
+    if (entryDir && entryAi) {
+      invoke<CodexSession[]>('get_sessions', { dir: entryDir, ai: entryAi })
         .then(sessions => {
           setCodexSessions(sessions)
         })
         .catch(err => {
-          console.error('获取 Codex 历史会话失败:', err)
+          console.error('获取历史会话失败:', err)
           setCodexSessions([])
         })
     } else {
       setCodexSessions([])
     }
-  }, [editIndex, config.entries])
+  }, [editIndex, entryDir, entryAi])
+
+  // 计算过滤后的列表
+  const filteredEntries = config.entries.map((entry, originalIndex) => ({
+    entry,
+    originalIndex
+  })).filter(({ entry }) => {
+    const query = searchText.toLowerCase().trim()
+    if (!query) return true
+    return (
+      entry.name.toLowerCase().includes(query) ||
+      entry.dir.toLowerCase().includes(query)
+    )
+  })
+
+  // 全选/全不选当前过滤出的列表
+  const handleSelectAll = (select: boolean) => {
+    const newEntries = [...config.entries]
+    filteredEntries.forEach(({ originalIndex }) => {
+      newEntries[originalIndex].enabled = select
+    })
+    const newConfig = { ...config, entries: newEntries }
+    setConfig(newConfig)
+    saveConfig(newConfig)
+    setStatus(select ? '已全选过滤后的项目' : '已取消全选过滤后的项目')
+  }
 
   // 刷新窗口列表
   const refreshWindows = async () => {
@@ -241,11 +270,14 @@ function App() {
 
   // 加载并查看详细会话历史
   const viewSessionHistory = async (sessId: string) => {
-    if (!sessId) return
+    if (!sessId || !currentEntry) return
     setIsLoadingHistory(true)
     setIsHistoryModalOpen(true)
     try {
-      const msgs = await invoke<CodexMessage[]>('get_codex_session_details', { sessionId: sessId })
+      const msgs = await invoke<CodexMessage[]>('get_session_details', { 
+        sessionId: sessId,
+        ai: currentEntry.ai
+      })
       setSessionMessages(msgs)
     } catch (e) {
       console.error('获取会话详情失败:', e)
@@ -326,6 +358,46 @@ function App() {
           </div>
 
           <div className="flex-1 bg-[#0f131b] border border-[#1b2233] rounded-2xl overflow-hidden flex flex-col shadow-xl shadow-black/30 min-h-0">
+            {/* 搜索与全选工具栏 */}
+            <div className="p-2.5 bg-[#0b0e16]/80 border-b border-[#1b2233] flex flex-col sm:flex-row gap-2 shrink-0">
+              <div className="relative flex-1">
+                <input
+                  type="text"
+                  value={searchText}
+                  onChange={e => setSearchText(e.target.value)}
+                  placeholder="搜索项目名称或工作目录..."
+                  className="w-full h-8 rounded-lg bg-[#080b11] border border-[#1b2233] focus:border-indigo-500 pl-8 pr-8 text-xs text-slate-200 focus:outline-none transition-all placeholder:text-slate-655"
+                />
+                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500 text-[11px]">
+                  🔍
+                </span>
+                {searchText && (
+                  <button
+                    onClick={() => setSearchText('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-350 text-[10px]"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+              <div className="flex gap-1.5 shrink-0">
+                <button
+                  onClick={() => handleSelectAll(true)}
+                  className="px-2.5 h-8 rounded-lg bg-[#121622] hover:bg-[#181d2c] border border-[#222a3d] hover:border-[#354366] text-slate-300 hover:text-slate-100 text-[10px] font-bold transition-all active:scale-95 flex items-center gap-1"
+                  title="启用当前过滤出的所有项目"
+                >
+                  ☑️ 全选
+                </button>
+                <button
+                  onClick={() => handleSelectAll(false)}
+                  className="px-2.5 h-8 rounded-lg bg-[#121622] hover:bg-[#181d2c] border border-[#222a3d] hover:border-[#354366] text-slate-300 hover:text-slate-100 text-[10px] font-bold transition-all active:scale-95 flex items-center gap-1"
+                  title="禁用当前过滤出的所有项目"
+                >
+                  ⬛ 全不选
+                </button>
+              </div>
+            </div>
+
             <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5 custom-scrollbar">
               {config.entries.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-slate-650 p-8 text-center">
@@ -333,8 +405,14 @@ function App() {
                   <p className="text-xs font-semibold text-slate-500">暂无项目目录</p>
                   <p className="text-[10px] text-slate-600 mt-1 max-w-[200px]">点击下方添加按钮，选择本地工作目录导入您的第一个项目。</p>
                 </div>
+              ) : filteredEntries.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-slate-650 p-8 text-center">
+                  <span className="text-2xl mb-2">🔍</span>
+                  <p className="text-xs font-semibold text-slate-500">未找到匹配项目</p>
+                  <p className="text-[10px] text-slate-600 mt-1">请尝试更换搜索关键字</p>
+                </div>
               ) : (
-                config.entries.map((entry, idx) => (
+                filteredEntries.map(({ entry, originalIndex: idx }) => (
                   <div
                     key={idx}
                     onClick={() => setSelectedIndex(idx)}
@@ -748,8 +826,8 @@ function App() {
                 </div>
               </div>
 
-              {/* 会话 ID (Resume) - 仅限 Codex */}
-              {currentEditingEntry.ai === 'codex' && (
+              {/* 会话 ID (Resume) */}
+              {currentEditingEntry && (
                 <div>
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-1.5 block">
                     会话 ID (Resume)

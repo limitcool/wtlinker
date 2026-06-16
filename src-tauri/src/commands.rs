@@ -263,10 +263,25 @@ fn build_wt_args_vec(entries: &[Entry], flags: &str, append_mode: bool, shell: &
             inner_cmd.push_str(" resume ");
             inner_cmd.push_str(&e.session);
         }
-        // 参数隔离：仅当 AI 为 Codex 时，才拼接 flags
-        if e.ai == AiProgram::Codex && !flags.trim().is_empty() {
-            inner_cmd.push(' ');
-            inner_cmd.push_str(flags.trim());
+        
+        let mut ai_flags = flags.trim().to_string();
+        if e.ai == AiProgram::Codex {
+            if !ai_flags.is_empty() {
+                inner_cmd.push(' ');
+                inner_cmd.push_str(&ai_flags);
+            }
+        } else if e.ai == AiProgram::Claude {
+            ai_flags = ai_flags.replace("--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions");
+            if !ai_flags.is_empty() {
+                inner_cmd.push(' ');
+                inner_cmd.push_str(&ai_flags);
+            }
+        } else if e.ai == AiProgram::Opencode {
+            let clean_flags = ai_flags.replace("--dangerously-bypass-approvals-and-sandbox", "").trim().to_string();
+            if !clean_flags.is_empty() {
+                inner_cmd.push(' ');
+                inner_cmd.push_str(&clean_flags);
+            }
         }
         args.push(inner_cmd);
     }
@@ -401,15 +416,17 @@ fn extract_user_preview(reader: &mut BufReader<File>) -> String {
     "新会话 (暂无内容预览)".to_string()
 }
 
-/// 获取某个 Codex 项目目录匹配的历史会话 ID 列表
+/// 获取某个项目目录匹配的历史会话 ID 列表（支持 codex, claude, opencode）
 #[tauri::command]
-pub fn get_codex_sessions(dir: String) -> Result<Vec<CodexSession>, String> {
+pub fn get_sessions(dir: String, ai: AiProgram) -> Result<Vec<CodexSession>, String> {
     let user_profile = std::env::var("USERPROFILE")
         .map_err(|_| "无法获取 USERPROFILE 环境变量".to_string())?;
 
-    let sessions_dir = PathBuf::from(user_profile)
-        .join(".codex")
-        .join("sessions");
+    let sessions_dir = match ai {
+        AiProgram::Codex => PathBuf::from(&user_profile).join(".codex").join("sessions"),
+        AiProgram::Claude => PathBuf::from(&user_profile).join(".claude").join("sessions"),
+        AiProgram::Opencode => PathBuf::from(&user_profile).join(".zcode").join("v2").join("sessions"),
+    };
 
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -482,18 +499,20 @@ fn extract_user_request(text: &str) -> String {
     text.to_string()
 }
 
-/// 获取某个特定 Codex 会话的详细对话历史
+/// 获取某个特定会话的详细对话历史（支持 codex, claude, opencode）
 #[tauri::command]
-pub fn get_codex_session_details(session_id: String) -> Result<Vec<CodexMessage>, String> {
+pub fn get_session_details(session_id: String, ai: AiProgram) -> Result<Vec<CodexMessage>, String> {
     let user_profile = std::env::var("USERPROFILE")
         .map_err(|_| "无法获取 USERPROFILE 环境变量".to_string())?;
 
-    let sessions_dir = PathBuf::from(user_profile)
-        .join(".codex")
-        .join("sessions");
+    let sessions_dir = match ai {
+        AiProgram::Codex => PathBuf::from(&user_profile).join(".codex").join("sessions"),
+        AiProgram::Claude => PathBuf::from(&user_profile).join(".claude").join("sessions"),
+        AiProgram::Opencode => PathBuf::from(&user_profile).join(".zcode").join("v2").join("sessions"),
+    };
 
     if !sessions_dir.exists() {
-        return Err("未找到 .codex/sessions 目录".to_string());
+        return Err(format!("未找到 {:?} 的 sessions 目录", ai));
     }
 
     let mut jsonl_files = Vec::new();

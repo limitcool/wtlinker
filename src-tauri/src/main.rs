@@ -15,8 +15,8 @@ fn main() {
             pick_folder,
             get_wt_windows,
             launch_wt,
-            get_codex_sessions,
-            get_codex_session_details,
+            get_sessions,
+            get_session_details,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
