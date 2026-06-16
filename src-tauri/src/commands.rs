@@ -425,7 +425,7 @@ pub fn get_sessions(dir: String, ai: AiProgram) -> Result<Vec<CodexSession>, Str
     let sessions_dir = match ai {
         AiProgram::Codex => PathBuf::from(&user_profile).join(".codex").join("sessions"),
         AiProgram::Claude => PathBuf::from(&user_profile).join(".claude").join("sessions"),
-        AiProgram::Opencode => PathBuf::from(&user_profile).join(".zcode").join("v2").join("sessions"),
+        AiProgram::Opencode => PathBuf::from(&user_profile).join(".opencode").join("sessions"),
     };
 
     if !sessions_dir.exists() {
@@ -508,7 +508,7 @@ pub fn get_session_details(session_id: String, ai: AiProgram) -> Result<Vec<Code
     let sessions_dir = match ai {
         AiProgram::Codex => PathBuf::from(&user_profile).join(".codex").join("sessions"),
         AiProgram::Claude => PathBuf::from(&user_profile).join(".claude").join("sessions"),
-        AiProgram::Opencode => PathBuf::from(&user_profile).join(".zcode").join("v2").join("sessions"),
+        AiProgram::Opencode => PathBuf::from(&user_profile).join(".opencode").join("sessions"),
     };
 
     if !sessions_dir.exists() {
