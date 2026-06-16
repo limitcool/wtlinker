@@ -356,22 +356,66 @@ fn normalize_path(p: &str) -> String {
     p.replace('/', "\\").to_lowercase()
 }
 
-/// 递归扫描指定目录下的 jsonl 文件
-fn scan_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
+/// 递归扫描指定目录下特定后缀的文件
+fn scan_files_by_ext(dir: &Path, extension: &str, files: &mut Vec<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                scan_jsonl_files(&path, files);
+                scan_files_by_ext(&path, extension, files);
             } else if path.is_file() {
                 if let Some(ext) = path.extension() {
-                    if ext == "jsonl" {
+                    if ext == extension {
                         files.push(path);
                     }
                 }
             }
         }
     }
+}
+
+/// 辅助函数：将 Unix 时间戳（毫秒）格式化为 RFC3339 风格的字符串（纯 Rust 算法，零第三方库依赖）
+fn format_timestamp_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = secs / 86400;
+    let r_secs = secs % 86400;
+    let hour = r_secs / 3600;
+    let min = (r_secs % 3600) / 60;
+    let sec = r_secs % 60;
+    
+    let mut year = 1970;
+    let mut day_of_year = days;
+    loop {
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_year = if is_leap { 366 } else { 365 };
+        if day_of_year >= days_in_year {
+            day_of_year -= days_in_year;
+            year += 1;
+        } else {
+            break;
+        }
+    }
+    
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let month_days = if is_leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    
+    let mut month = 1;
+    let mut rem_days = day_of_year;
+    for &days_in_month in &month_days {
+        if rem_days >= days_in_month {
+            rem_days -= days_in_month;
+            month += 1;
+        } else {
+            break;
+        }
+    }
+    let day = rem_days + 1;
+    
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, hour, min, sec)
 }
 
 /// 辅助函数：将字符串过滤清理换行并截断，用于做摘要预览
@@ -422,42 +466,171 @@ pub fn get_sessions(dir: String, ai: AiProgram) -> Result<Vec<CodexSession>, Str
     let user_profile = std::env::var("USERPROFILE")
         .map_err(|_| "无法获取 USERPROFILE 环境变量".to_string())?;
 
-    let sessions_dir = match ai {
-        AiProgram::Codex => PathBuf::from(&user_profile).join(".codex").join("sessions"),
-        AiProgram::Claude => PathBuf::from(&user_profile).join(".claude").join("sessions"),
-        AiProgram::Opencode => PathBuf::from(&user_profile).join(".opencode").join("sessions"),
-    };
-
-    if !sessions_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut jsonl_files = Vec::new();
-    scan_jsonl_files(&sessions_dir, &mut jsonl_files);
-
     let target_dir_norm = normalize_path(&dir);
     let mut sessions = Vec::new();
 
-    for path in jsonl_files {
-        if let Ok(file) = File::open(&path) {
-            let mut reader = BufReader::new(file);
-            let mut first_line = String::new();
-            if reader.read_line(&mut first_line).is_ok() {
-                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&first_line) {
-                    if meta.msg_type == "session_meta" {
-                        let session_cwd_norm = normalize_path(&meta.payload.cwd);
-                        if session_cwd_norm == target_dir_norm {
+    match ai {
+        AiProgram::Codex => {
+            let sessions_dir = PathBuf::from(&user_profile).join(".codex").join("sessions");
+            if !sessions_dir.exists() {
+                return Ok(Vec::new());
+            }
+
+            let mut jsonl_files = Vec::new();
+            scan_files_by_ext(&sessions_dir, "jsonl", &mut jsonl_files);
+
+            for path in jsonl_files {
+                if let Ok(file) = File::open(&path) {
+                    let mut reader = BufReader::new(file);
+                    let mut first_line = String::new();
+                    if reader.read_line(&mut first_line).is_ok() {
+                        if let Ok(meta) = serde_json::from_str::<SessionMeta>(&first_line) {
+                            if meta.msg_type == "session_meta" {
+                                let session_cwd_norm = normalize_path(&meta.payload.cwd);
+                                if session_cwd_norm == target_dir_norm {
+                                    let last_modified = fs::metadata(&path)
+                                        .and_then(|m| m.modified())
+                                        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+                                        .unwrap_or(0);
+
+                                    let preview = extract_user_preview(&mut reader);
+
+                                    sessions.push(CodexSession {
+                                        id: meta.payload.id,
+                                        timestamp: meta.timestamp,
+                                        last_modified,
+                                        preview,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        AiProgram::Claude => {
+            let sessions_dir = PathBuf::from(&user_profile).join(".claude").join("projects");
+            if !sessions_dir.exists() {
+                return Ok(Vec::new());
+            }
+
+            let mut jsonl_files = Vec::new();
+            scan_files_by_ext(&sessions_dir, "jsonl", &mut jsonl_files);
+
+            for path in jsonl_files {
+                if let Ok(file) = File::open(&path) {
+                    let reader = BufReader::new(file);
+                    let mut session_id = String::new();
+                    let mut timestamp = String::new();
+                    let mut is_matched = false;
+                    let mut preview = String::new();
+
+                    use serde_json::Value;
+                    for line_res in reader.lines() {
+                        if let Ok(line) = line_res {
+                            if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                                if let Some(cwd) = val.get("cwd").and_then(|c| c.as_str()) {
+                                    if normalize_path(cwd) == target_dir_norm {
+                                        is_matched = true;
+                                    }
+                                }
+                                if session_id.is_empty() {
+                                    if let Some(sid) = val.get("sessionId").and_then(|s| s.as_str()) {
+                                        session_id = sid.to_string();
+                                    }
+                                }
+                                if timestamp.is_empty() {
+                                    if let Some(t) = val.get("timestamp").and_then(|s| s.as_str()) {
+                                        timestamp = t.to_string();
+                                    }
+                                }
+                                if preview.is_empty() {
+                                    if let Some(role) = val.pointer("/message/role").and_then(|r| r.as_str()) {
+                                        if role == "user" {
+                                            if let Some(content) = val.pointer("/message/content").and_then(|c| c.as_str()) {
+                                                if !content.contains("<INSTRUCTIONS>") {
+                                                    preview = truncate_string(content, 75);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if is_matched && !session_id.is_empty() {
+                        let last_modified = fs::metadata(&path)
+                            .and_then(|m| m.modified())
+                            .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+                            .unwrap_or(0);
+                        if preview.is_empty() {
+                            preview = "新会话 (暂无内容预览)".to_string();
+                        }
+                        sessions.push(CodexSession {
+                            id: session_id,
+                            timestamp,
+                            last_modified,
+                            preview,
+                        });
+                    }
+                }
+            }
+        }
+        AiProgram::Opencode => {
+            let mut sessions_dir = PathBuf::from(&user_profile).join(".opencode").join("sessions");
+            if !sessions_dir.exists() {
+                sessions_dir = PathBuf::from(&user_profile).join(".zcode").join("v2").join("sessions");
+            }
+            if !sessions_dir.exists() {
+                return Ok(Vec::new());
+            }
+
+            let mut json_files = Vec::new();
+            scan_files_by_ext(&sessions_dir, "json", &mut json_files);
+
+            #[derive(Deserialize)]
+            #[allow(non_snake_case)]
+            struct ZCodeMeta {
+                taskId: String,
+                workspacePath: String,
+                createdAt: u64,
+            }
+            #[derive(Deserialize)]
+            struct ZCodeMessage {
+                role: String,
+                content: String,
+            }
+            #[derive(Deserialize)]
+            struct ZCodeSessionFile {
+                meta: ZCodeMeta,
+                messages: Option<Vec<ZCodeMessage>>,
+            }
+
+            for path in json_files {
+                if let Ok(file_content) = fs::read_to_string(&path) {
+                    if let Ok(sess_data) = serde_json::from_str::<ZCodeSessionFile>(&file_content) {
+                        if normalize_path(&sess_data.meta.workspacePath) == target_dir_norm {
                             let last_modified = fs::metadata(&path)
                                 .and_then(|m| m.modified())
                                 .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
                                 .unwrap_or(0);
 
-                            // 从剩余行中提取用户第一个真实 Goal 提问作为预览
-                            let preview = extract_user_preview(&mut reader);
+                            let mut preview = "新会话 (暂无内容预览)".to_string();
+                            if let Some(msgs) = &sess_data.messages {
+                                for m in msgs {
+                                    if m.role == "user" {
+                                        preview = truncate_string(&m.content, 75);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let ts_str = format_timestamp_ms(sess_data.meta.createdAt);
 
                             sessions.push(CodexSession {
-                                id: meta.payload.id,
-                                timestamp: meta.timestamp,
+                                id: sess_data.meta.taskId,
+                                timestamp: ts_str,
                                 last_modified,
                                 preview,
                             });
@@ -505,74 +678,219 @@ pub fn get_session_details(session_id: String, ai: AiProgram) -> Result<Vec<Code
     let user_profile = std::env::var("USERPROFILE")
         .map_err(|_| "无法获取 USERPROFILE 环境变量".to_string())?;
 
-    let sessions_dir = match ai {
-        AiProgram::Codex => PathBuf::from(&user_profile).join(".codex").join("sessions"),
-        AiProgram::Claude => PathBuf::from(&user_profile).join(".claude").join("sessions"),
-        AiProgram::Opencode => PathBuf::from(&user_profile).join(".opencode").join("sessions"),
-    };
+    let mut messages = Vec::new();
 
-    if !sessions_dir.exists() {
-        return Err(format!("未找到 {:?} 的 sessions 目录", ai));
-    }
+    match ai {
+        AiProgram::Codex => {
+            let sessions_dir = PathBuf::from(&user_profile).join(".codex").join("sessions");
+            if !sessions_dir.exists() {
+                return Err("未找到 .codex/sessions 目录".to_string());
+            }
 
-    let mut jsonl_files = Vec::new();
-    scan_jsonl_files(&sessions_dir, &mut jsonl_files);
+            let mut jsonl_files = Vec::new();
+            scan_files_by_ext(&sessions_dir, "jsonl", &mut jsonl_files);
 
-    // 寻找匹配 session_id 的文件
-    let mut matched_path = None;
-    for path in jsonl_files {
-        if let Ok(file) = File::open(&path) {
-            let mut reader = BufReader::new(file);
-            let mut first_line = String::new();
-            if reader.read_line(&mut first_line).is_ok() {
-                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&first_line) {
-                    if meta.msg_type == "session_meta" && meta.payload.id == session_id {
-                        matched_path = Some(path);
-                        break;
+            // 寻找匹配 session_id 的文件
+            let mut matched_path = None;
+            for path in jsonl_files {
+                if let Ok(file) = File::open(&path) {
+                    let mut reader = BufReader::new(file);
+                    let mut first_line = String::new();
+                    if reader.read_line(&mut first_line).is_ok() {
+                        if let Ok(meta) = serde_json::from_str::<SessionMeta>(&first_line) {
+                            if meta.msg_type == "session_meta" && meta.payload.id == session_id {
+                                matched_path = Some(path);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let path = match matched_path {
+                Some(p) => p,
+                None => return Err(format!("未找到会话 ID 为 {} 的日志文件", session_id)),
+            };
+
+            let file = File::open(path).map_err(|e| format!("无法打开日志文件: {}", e))?;
+            let reader = BufReader::new(file);
+
+            use serde_json::Value;
+            for line_res in reader.lines() {
+                let line = match line_res {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                    if let Some(role) = val.pointer("/payload/role").and_then(|r| r.as_str()) {
+                        if role == "user" || role == "assistant" || role == "model" {
+                            let mut txt_opt = val.pointer("/payload/content/0/text").and_then(|t| t.as_str());
+                            if txt_opt.is_none() {
+                                txt_opt = val.pointer("/payload/content/0/input_text").and_then(|t| t.as_str());
+                            }
+                            if txt_opt.is_none() {
+                                txt_opt = val.pointer("/payload/content/0/output_text").and_then(|t| t.as_str());
+                            }
+                            if let Some(txt) = txt_opt {
+                                let cleaned = if role == "user" {
+                                    extract_user_request(txt)
+                                } else {
+                                    txt.replace("<turn_aborted>", "").trim().to_string()
+                                };
+
+                                if !cleaned.is_empty() {
+                                    messages.push(CodexMessage {
+                                        role: if role == "user" { "user".to_string() } else { "assistant".to_string() },
+                                        content: cleaned,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-    }
+        AiProgram::Claude => {
+            let sessions_dir = PathBuf::from(&user_profile).join(".claude").join("projects");
+            if !sessions_dir.exists() {
+                return Err("未找到 .claude/projects 目录".to_string());
+            }
 
-    let path = match matched_path {
-        Some(p) => p,
-        None => return Err(format!("未找到会话 ID 为 {} 的日志文件", session_id)),
-    };
+            let mut jsonl_files = Vec::new();
+            scan_files_by_ext(&sessions_dir, "jsonl", &mut jsonl_files);
 
-    let file = File::open(path).map_err(|e| format!("无法打开日志文件: {}", e))?;
-    let reader = BufReader::new(file);
-    let mut messages = Vec::new();
-    
-    use serde_json::Value;
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if let Ok(val) = serde_json::from_str::<Value>(&line) {
-            if let Some(role) = val.pointer("/payload/role").and_then(|r| r.as_str()) {
-                if role == "user" || role == "assistant" || role == "model" {
-                    let mut txt_opt = val.pointer("/payload/content/0/text").and_then(|t| t.as_str());
-                    if txt_opt.is_none() {
-                        txt_opt = val.pointer("/payload/content/0/input_text").and_then(|t| t.as_str());
-                    }
-                    if txt_opt.is_none() {
-                        txt_opt = val.pointer("/payload/content/0/output_text").and_then(|t| t.as_str());
-                    }
-                    if let Some(txt) = txt_opt {
-                        let cleaned = if role == "user" {
-                            extract_user_request(txt)
-                        } else {
-                            txt.replace("<turn_aborted>", "").trim().to_string()
-                        };
-                        
-                        if !cleaned.is_empty() {
-                            messages.push(CodexMessage {
-                                role: if role == "user" { "user".to_string() } else { "assistant".to_string() },
-                                content: cleaned,
-                            });
+            let mut matched_path = None;
+            for path in jsonl_files {
+                if let Ok(file) = File::open(&path) {
+                    let reader = BufReader::new(file);
+                    use serde_json::Value;
+                    for line_res in reader.lines() {
+                        if let Ok(line) = line_res {
+                            if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                                if let Some(sid) = val.get("sessionId").and_then(|s| s.as_str()) {
+                                    if sid == session_id {
+                                        matched_path = Some(path.clone());
+                                        break;
+                                    }
+                                }
+                            }
                         }
+                    }
+                    if matched_path.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            let path = match matched_path {
+                Some(p) => p,
+                None => return Err(format!("未找到会话 ID 为 {} 的日志文件", session_id)),
+            };
+
+            let file = File::open(path).map_err(|e| format!("无法打开日志文件: {}", e))?;
+            let reader = BufReader::new(file);
+
+            use serde_json::Value;
+            for line_res in reader.lines() {
+                let line = match line_res {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                    let role_opt = val.get("type").and_then(|t| t.as_str());
+                    if let Some(role) = role_opt {
+                        if role == "user" {
+                            if let Some(content) = val.pointer("/message/content").and_then(|c| c.as_str()) {
+                                let cleaned = extract_user_request(content);
+                                if !cleaned.is_empty() {
+                                    messages.push(CodexMessage {
+                                        role: "user".to_string(),
+                                        content: cleaned,
+                                    });
+                                }
+                            }
+                        } else if role == "assistant" {
+                            let mut text_content = String::new();
+                            if let Some(content_arr) = val.pointer("/message/content").and_then(|c| c.as_array()) {
+                                for item in content_arr {
+                                    if let Some(t) = item.get("type").and_then(|tp| tp.as_str()) {
+                                        if t == "text" {
+                                            if let Some(txt) = item.get("text").and_then(|tx| tx.as_str()) {
+                                                text_content.push_str(txt);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let cleaned = text_content.replace("<turn_aborted>", "").trim().to_string();
+                            if !cleaned.is_empty() {
+                                messages.push(CodexMessage {
+                                    role: "assistant".to_string(),
+                                    content: cleaned,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        AiProgram::Opencode => {
+            let mut sessions_dir = PathBuf::from(&user_profile).join(".opencode").join("sessions");
+            if !sessions_dir.exists() {
+                sessions_dir = PathBuf::from(&user_profile).join(".zcode").join("v2").join("sessions");
+            }
+            if !sessions_dir.exists() {
+                return Err("未找到 OpenCode 会话日志目录".to_string());
+            }
+
+            let mut json_files = Vec::new();
+            scan_files_by_ext(&sessions_dir, "json", &mut json_files);
+
+            #[derive(Deserialize)]
+            #[allow(non_snake_case)]
+            struct ZCodeMeta {
+                taskId: String,
+            }
+            #[derive(Deserialize)]
+            struct ZCodeMessage {
+                role: String,
+                content: String,
+            }
+            #[derive(Deserialize)]
+            struct ZCodeSessionFile {
+                meta: ZCodeMeta,
+                messages: Option<Vec<ZCodeMessage>>,
+            }
+
+            let mut matched_file_content = None;
+            for path in json_files {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(sess_data) = serde_json::from_str::<ZCodeSessionFile>(&content) {
+                        if sess_data.meta.taskId == session_id {
+                            matched_file_content = Some(sess_data);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let sess_data = match matched_file_content {
+                Some(data) => data,
+                None => return Err(format!("未找到会话 ID 为 {} 的日志文件", session_id)),
+            };
+
+            if let Some(msgs) = sess_data.messages {
+                for m in msgs {
+                    let cleaned = if m.role == "user" {
+                        extract_user_request(&m.content)
+                    } else {
+                        m.content.replace("<turn_aborted>", "").trim().to_string()
+                    };
+                    if !cleaned.is_empty() {
+                        messages.push(CodexMessage {
+                            role: if m.role == "user" { "user".to_string() } else { "assistant".to_string() },
+                            content: cleaned,
+                        });
                     }
                 }
             }
